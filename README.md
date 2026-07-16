@@ -14,3 +14,4 @@ A collection of Tampermonkey userscripts for enhancing various websites.
 | [DBLP_readable_key.js](DBLP_readable_key.js) | Replaces DBLP BibTeX citation keys with readable ones (e.g., `vaswani2017attention`) and adds a copy button |
 | [Weibo_skip_exernal-link_warning.js](Weibo_skip_exernal-link_warning.js) | Auto-redirects Weibo external link warnings to the actual target URL |
 | [Zhihu_chuanlan_copy.js](Zhihu_chuanlan_copy.js) | Exports Zhihu Zhuanlan articles as Markdown with LaTeX formulas preserved |
+| [arxivsignals-exclude-tags.user.js](arxivsignals-exclude-tags.user.js) | Exclude tags on arxivsignals.io, use option to exclude |
