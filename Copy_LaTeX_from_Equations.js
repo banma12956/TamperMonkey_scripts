@@ -1,247 +1,263 @@
 // ==UserScript==
-// @name         Copy LaTeX from Equations
+// @name         Copy LaTeX from Equations (fixed)
 // @namespace    http://tampermonkey.net/
-// @version      1.0
-// @description  Click any rendered math equation on ChatGPT or Claude to copy its LaTeX source to clipboard
+// @version      2.1.0
+// @description  Click rendered math on ChatGPT or Claude to copy its LaTeX source
 // @match        https://chatgpt.com/*
 // @match        https://chat.openai.com/*
 // @match        https://claude.ai/*
-// @grant        none
+// @grant        GM_setClipboard
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  // ── All selectors that may wrap a math equation ───────────────────────
-  const MATH_SELECTORS = [
+  /*
+   * Do not scan and tag the page. Both sites are single-page applications and
+   * frequently replace streamed equation nodes. Event delegation keeps working
+   * even after those replacements.
+   */
+  const MATH_SELECTOR = [
     '.katex',
-    '.katex-display',
     'mjx-container',
     '.MathJax',
     '.MathJax_Display',
     '.math-inline',
     '.math-display',
-    'span.math',
+    '[role="math"]',
+    '[data-math]',
+    'math[alttext]',
+    'svg[data-latex]',
   ].join(', ');
 
-  // ── Inject styles ─────────────────────────────────────────────────────
   const style = document.createElement('style');
   style.textContent = `
-    .latex-copy-target {
-      cursor: pointer !important;
-      transition: outline 0.15s ease, background 0.15s ease !important;
-      border-radius: 4px !important;
-      position: relative;
+    .katex, mjx-container, .MathJax, .MathJax_Display,
+    .math-inline, .math-display, [role="math"], [data-math],
+    math[alttext], svg[data-latex] {
+      cursor: copy !important;
+      border-radius: 4px;
     }
-    .latex-copy-target:hover {
+
+    .katex:hover, mjx-container:hover, .MathJax:hover,
+    .MathJax_Display:hover, .math-inline:hover, .math-display:hover,
+    [role="math"]:hover, [data-math]:hover,
+    math[alttext]:hover, svg[data-latex]:hover {
       outline: 2px solid #6d5cff !important;
       background: rgba(109, 92, 255, 0.08) !important;
     }
-    .latex-copy-target:active {
-      outline-color: #a695ff !important;
-      background: rgba(109, 92, 255, 0.16) !important;
-    }
 
-    #latex-copy-toast {
+    #latex-copy-toast-v2 {
       position: fixed;
-      bottom: 28px;
       left: 50%;
-      transform: translateX(-50%) translateY(20px);
+      bottom: 28px;
+      transform: translate(-50%, 18px);
+      z-index: 2147483647;
+      max-width: min(600px, calc(100vw - 32px));
+      padding: 10px 16px;
+      border: 1px solid #45475a;
+      border-radius: 10px;
       background: #1e1e2e;
       color: #cdd6f4;
-      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
-      font-size: 13px;
-      line-height: 1.5;
-      padding: 10px 18px;
-      border-radius: 10px;
-      box-shadow: 0 4px 24px rgba(0,0,0,0.35);
-      z-index: 2147483647;
+      box-shadow: 0 4px 24px rgba(0, 0, 0, .35);
+      font: 13px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-wrap: anywhere;
+      white-space: pre-wrap;
       opacity: 0;
       pointer-events: none;
-      transition: opacity 0.25s ease, transform 0.25s ease;
-      max-width: 600px;
-      word-break: break-all;
-      white-space: pre-wrap;
-      border: 1px solid #45475a;
+      transition: opacity .2s, transform .2s;
     }
-    #latex-copy-toast.visible {
+
+    #latex-copy-toast-v2.visible {
       opacity: 1;
-      pointer-events: auto;
-      transform: translateX(-50%) translateY(0);
-    }
-    #latex-copy-toast .toast-label {
-      color: #a6e3a1;
-      font-weight: 600;
-      margin-right: 6px;
+      transform: translate(-50%, 0);
     }
   `;
-  document.head.appendChild(style);
+  (document.head || document.documentElement).appendChild(style);
 
-  // ── Toast ─────────────────────────────────────────────────────────────
-  const toast = document.createElement('div');
-  toast.id = 'latex-copy-toast';
-  document.body.appendChild(toast);
+  let toastTimer;
 
-  let toastTimer = null;
-  function showToast(latex) {
-    const preview = latex.length > 120 ? latex.slice(0, 120) + '…' : latex;
-    toast.innerHTML = `<span class="toast-label">✓ LaTeX copied:</span>${preview}`;
+  function showToast(message, ok = true) {
+    let toast = document.getElementById('latex-copy-toast-v2');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'latex-copy-toast-v2';
+      (document.body || document.documentElement).appendChild(toast);
+    }
+
+    const preview = message.length > 140 ? `${message.slice(0, 140)}…` : message;
+    toast.textContent = ok ? `✓ LaTeX copied: ${preview}` : `Could not copy: ${preview}`;
+    toast.style.color = ok ? '#cdd6f4' : '#f38ba8';
     toast.classList.add('visible');
     clearTimeout(toastTimer);
     toastTimer = setTimeout(() => toast.classList.remove('visible'), 2500);
   }
 
-  // ── LaTeX extraction ──────────────────────────────────────────────────
+  function clean(value) {
+    const result = value == null ? '' : String(value).trim();
+    return result || null;
+  }
 
-  /** KaTeX: <annotation encoding="application/x-tex"> */
-  function extractFromKatex(el) {
-    const ann = el.querySelector('annotation[encoding="application/x-tex"]');
-    if (ann) return ann.textContent.trim();
+  function unwrapDelimiters(value) {
+    const text = clean(value);
+    if (!text) return null;
+
+    const pairs = [
+      [/^\\\(([\s\S]*)\\\)$/u, 1],
+      [/^\\\[([\s\S]*)\\\]$/u, 1],
+      [/^\$\$([\s\S]*)\$\$$/u, 1],
+      [/^\$([^$]*)\$$/u, 1],
+    ];
+
+    for (const [pattern, group] of pairs) {
+      const match = text.match(pattern);
+      if (match) return clean(match[group]);
+    }
+    return text;
+  }
+
+  function readAttribute(element, names) {
+    for (const name of names) {
+      const value = clean(element?.getAttribute?.(name));
+      if (value) return value;
+    }
     return null;
   }
 
-  /** MathJax v3: mjx-container */
-  function extractFromMathJaxV3(el) {
-    const c = el.closest('mjx-container') || el.querySelector('mjx-container');
-    if (!c) return null;
-    if (c.getAttribute('aria-label')) return c.getAttribute('aria-label').trim();
-    if (c.dataset.latex) return c.dataset.latex.trim();
-    const s = c.querySelector('script[type*="math/tex"]');
-    if (s) return s.textContent.trim();
+  function extractLatex(start) {
+    /* Site-owned attributes, including newer renderer variants. */
+    let node = start;
+    for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+      const value = readAttribute(node, [
+        'data-math',
+        'data-latex',
+        'data-tex',
+        'data-original',
+        'data-original-text',
+        'data-math-source',
+        'data-latex-source',
+      ]);
+      if (value) return unwrapDelimiters(value);
+    }
+
+    const container =
+      start.closest?.('.katex, mjx-container, .MathJax, .MathJax_Display, [role="math"]') ||
+      start;
+
+    /* KaTeX keeps the original input in its hidden MathML annotation. */
+    const annotation = container.querySelector?.(
+      'annotation[encoding="application/x-tex"], annotation[encoding="text/x-tex"], annotation',
+    );
+    const annotationValue = clean(annotation?.textContent);
+    if (annotationValue) return unwrapDelimiters(annotationValue);
+
+    /* Search descendants too: recent renderers put metadata below the wrapper. */
+    const sourceSelector = [
+      'math[alttext]',
+      'svg[data-latex]',
+      '[data-math]',
+      '[data-latex]',
+      '[data-tex]',
+      '[data-original]',
+      '[data-original-text]',
+      '[data-math-source]',
+      '[data-latex-source]',
+    ].join(', ');
+    const sourceNodes = [
+      ...(container.matches?.(sourceSelector) ? [container] : []),
+      ...(container.querySelectorAll?.(sourceSelector) || []),
+    ];
+    for (const sourceNode of sourceNodes) {
+      const sourceValue = readAttribute(sourceNode, [
+        'alttext',
+        'data-math',
+        'data-latex',
+        'data-tex',
+        'data-original',
+        'data-original-text',
+        'data-math-source',
+        'data-latex-source',
+      ]);
+      if (sourceValue) return unwrapDelimiters(sourceValue);
+    }
+
+    /* Older MathJax versions place the source in an adjacent script node. */
+    const script =
+      container.querySelector?.('script[type*="math/tex"]') ||
+      container.parentElement?.querySelector?.('script[type*="math/tex"]');
+    const scriptValue = clean(script?.textContent);
+    if (scriptValue) return scriptValue;
+
+    /* Last resorts used by a few accessibility-oriented renderers. */
+    const accessibleNode = container.querySelector?.(
+      '[aria-label], math[alttext], svg > title, .sr-only, .visually-hidden',
+    );
+    const accessibleValue =
+      readAttribute(container, ['aria-label', 'title', 'alttext']) ||
+      readAttribute(accessibleNode, ['aria-label', 'title', 'alttext']) ||
+      clean(accessibleNode?.textContent);
+    if (accessibleValue) return unwrapDelimiters(accessibleValue);
+
+    /* Some components retain delimited TeX in a hidden text node. */
+    const text = clean(container.textContent);
+    const delimited = text?.match(/\\\(([\s\S]*?)\\\)|\\\[([\s\S]*?)\\\]|\$\$([\s\S]*?)\$\$/u);
+    if (delimited) return clean(delimited[1] ?? delimited[2] ?? delimited[3]);
+
     return null;
   }
 
-  /** MathJax v2: .MathJax */
-  function extractFromMathJaxV2(el) {
-    const mj = el.closest('.MathJax, .MathJax_Display') || el.querySelector('.MathJax, .MathJax_Display');
-    if (!mj) return null;
-    const s = mj.parentElement?.querySelector('script[type*="math/tex"]');
-    if (s) return s.textContent.trim();
+  function copyText(text) {
+    /* Tampermonkey's clipboard API is not subject to the page's permissions. */
     try {
-      const jax = window.MathJax?.Hub?.getJaxFor?.(mj);
-      if (jax?.originalText) return jax.originalText.trim();
-    } catch (_) {}
-    return null;
-  }
-
-  /** data-* attributes */
-  function extractFromData(el) {
-    let node = el;
-    for (let i = 0; i < 6 && node; i++) {
-      for (const attr of ['data-latex', 'data-tex', 'data-original']) {
-        const v = node.getAttribute?.(attr);
-        if (v) return v.trim();
-      }
-      node = node.parentElement;
+      GM_setClipboard(text, 'text');
+      return true;
+    } catch (_) {
+      /* Continue to browser fallbacks. */
     }
-    return null;
-  }
 
-  function getLatex(target) {
-    let el = target;
-    for (let i = 0; i < 10 && el; i++) {
-      const latex =
-        extractFromKatex(el) ||
-        extractFromMathJaxV3(el) ||
-        extractFromMathJaxV2(el) ||
-        extractFromData(el);
-      if (latex) return latex;
-      el = el.parentElement;
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.setAttribute('readonly', '');
+      textarea.style.cssText = 'position:fixed;left:-10000px;top:0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const copied = document.execCommand('copy');
+      textarea.remove();
+      return copied;
+    } catch (_) {
+      return false;
     }
-    return null;
   }
 
-  // ── Tag math elements ─────────────────────────────────────────────────
-  function tagMathElements(root) {
-    const els = (root || document).querySelectorAll(MATH_SELECTORS);
-    let tagCount = 0;
-    els.forEach((el) => {
-      if (el.classList.contains('latex-copy-target')) return;
-      if (el.closest('.latex-copy-target')) return;
-      if (getLatex(el)) {
-        el.classList.add('latex-copy-target');
-        tagCount++;
-      }
-    });
-    return tagCount;
-  }
+  document.addEventListener('click', (event) => {
+    const origin = event.target instanceof Element
+      ? event.target
+      : event.target?.parentElement;
+    const math = origin?.closest?.(MATH_SELECTOR);
+    if (!math) return;
 
-  // ── MutationObserver ──────────────────────────────────────────────────
-  let scanTimeout = null;
-  const observer = new MutationObserver(() => {
-    // Debounce: Claude streams fast, avoid scanning on every tiny mutation
-    clearTimeout(scanTimeout);
-    scanTimeout = setTimeout(() => tagMathElements(), 200);
-  });
-  observer.observe(document.body, { childList: true, subtree: true });
+    const latex = extractLatex(math);
+    if (!latex) {
+      console.warn('[Copy LaTeX v2] Equation source not found.', {
+        matchedElement: math,
+        outerHTML: math.outerHTML,
+        attributes: Object.fromEntries(
+          [...math.attributes].map((attribute) => [attribute.name, attribute.value]),
+        ),
+      });
+      showToast('the page did not expose the equation source', false);
+      return;
+    }
 
-  // Initial + delayed scans
-  tagMathElements();
-  setTimeout(() => tagMathElements(), 1500);
-  setTimeout(() => tagMathElements(), 4000);
-  setTimeout(() => tagMathElements(), 8000);
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
 
-  // ── Click handler ─────────────────────────────────────────────────────
-  document.addEventListener('click', (e) => {
-    const mathEl = e.target.closest('.latex-copy-target');
-    if (!mathEl) return;
-
-    const latex = getLatex(mathEl);
-    if (!latex) return;
-
-    e.preventDefault();
-    e.stopPropagation();
-    e.stopImmediatePropagation();
-
-    navigator.clipboard.writeText(latex).then(() => {
-      showToast(latex);
-    }).catch(() => {
-      // Fallback: execCommand
-      const ta = document.createElement('textarea');
-      ta.value = latex;
-      ta.style.cssText = 'position:fixed;left:-9999px';
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      ta.remove();
-      showToast(latex);
-    });
+    if (copyText(latex)) showToast(latex);
+    else showToast('clipboard access was denied', false);
   }, true);
 
-  // ── Debug (accessible from console since @grant none) ─────────────────
-  window.__latexCopyDebug = function () {
-    console.log('%c[Copy LaTeX Debug]', 'color: #6d5cff; font-weight: bold');
-
-    const all = document.querySelectorAll(MATH_SELECTORS);
-    console.log(`Found ${all.length} element(s) matching math selectors.`);
-
-    if (all.length === 0) {
-      console.log('No math elements found. Dumping all elements with "math" or "katex" in class name:');
-      document.querySelectorAll('*').forEach((el) => {
-        const cls = el.className?.toString?.() || '';
-        if (/math|katex|mjx/i.test(cls)) {
-          console.log(' ', el.tagName, cls, el);
-        }
-      });
-    } else {
-      all.forEach((el, i) => {
-        const latex = getLatex(el);
-        const tagged = el.classList.contains('latex-copy-target');
-        console.log(
-          `  #${i}`,
-          el.tagName + '.' + [...el.classList].join('.'),
-          tagged ? '✅ tagged' : '❌ NOT tagged',
-          latex ? `=> "${latex.slice(0, 80)}…"` : '=> ⚠️ NO LATEX FOUND',
-          el
-        );
-      });
-    }
-
-    const tagged = document.querySelectorAll('.latex-copy-target');
-    console.log(`\nTotal tagged (clickable): ${tagged.length}`);
-  };
-
-  console.log('%c[Copy LaTeX v3] ✓ Loaded', 'color: #a6e3a1; font-weight: bold',
-    '— click equations to copy. Run __latexCopyDebug() to inspect.');
-})();
+  console.info('[Copy LaTeX v2] Loaded. Click a highlighted equation to copy.');
+}());
